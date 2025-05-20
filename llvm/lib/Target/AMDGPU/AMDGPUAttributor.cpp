@@ -14,6 +14,8 @@
 #include "GCNSubtarget.h"
 #include "Utils/AMDGPUBaseInfo.h"
 #include "llvm/Analysis/CycleAnalysis.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Analysis/UniformityAnalysis.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/IntrinsicsR600.h"
@@ -1299,6 +1301,111 @@ struct AAAMDGPUNoAGPR
 
 const char AAAMDGPUNoAGPR::ID = 0;
 
+struct AAAMDGPUUniform : public StateWrapper<BooleanState, AbstractAttribute> {
+  using Base = StateWrapper<BooleanState, AbstractAttribute>;
+  AAAMDGPUUniform(const IRPosition &IRP, Attributor &A) : Base(IRP) {}
+
+  /// Create an abstract attribute view for the position \p IRP.
+  static AAAMDGPUUniform &createForPosition(const IRPosition &IRP,
+                                            Attributor &A);
+
+  /// See AbstractAttribute::getName()
+  const std::string getName() const override { return "AAAMDGPUUniform"; }
+
+  const std::string getAsStr(Attributor *A) const override {
+    return getAssumed() ? "inreg" : "non-inreg";
+  }
+
+  void trackStatistics() const override {}
+
+  /// See AbstractAttribute::getIdAddr()
+  const char *getIdAddr() const override { return &ID; }
+
+  /// This function should return true if the type of the \p AA is
+  /// AAAMDGPUUniform
+  static bool classof(const AbstractAttribute *AA) {
+    return (AA->getIdAddr() == &ID);
+  }
+
+  /// Unique ID (due to the unique address)
+  static const char ID;
+};
+
+const char AAAMDGPUUniform::ID = 0;
+
+struct AAAMDGPUUniformArgument : public AAAMDGPUUniform {
+  AAAMDGPUUniformArgument(const IRPosition &IRP, Attributor &A)
+      : AAAMDGPUUniform(IRP, A) {}
+
+  void initialize(Attributor &A) override {
+    Argument *Arg = getAssociatedArgument();
+    if (Arg->hasAttribute(Attribute::InReg) ||
+        AMDGPU::isEntryFunctionCC(Arg->getParent()->getCallingConv()))
+      indicateOptimisticFixpoint();
+  }
+
+  ChangeStatus updateImpl(Attributor &A) override {
+    unsigned ArgNo = getAssociatedArgument()->getArgNo();
+
+    auto isUniform = [&](AbstractCallSite ACS) -> bool {
+      CallBase *CB = ACS.getInstruction();
+      Value *V = CB->getArgOperandUse(ArgNo);
+      if (isa<Constant>(V))
+        return true;
+      Function *F = nullptr;
+      if (auto *Arg = dyn_cast<Argument>(V)) {
+        auto *AA =
+            A.getOrCreateAAFor<AAAMDGPUUniform>(IRPosition::argument(*Arg));
+        if (AA)
+          return AA->isValidState();
+        F = Arg->getParent();
+      } else if (auto *I = dyn_cast<Instruction>(V)) {
+        F = I->getFunction();
+      }
+
+      if (F) {
+        auto *UA =
+            A.getInfoCache()
+                .getAnalysisResultForFunction<UniformityInfoAnalysis>(*F);
+        return UA && UA->isUniform(V);
+      }
+
+      // What else can it be here?
+      return false;
+    };
+
+    bool UsedAssumedInformation = true;
+    if (!A.checkForAllCallSites(isUniform, *this, /*RequireAllCallSites=*/true,
+                                UsedAssumedInformation))
+      return indicatePessimisticFixpoint();
+
+    if (!UsedAssumedInformation)
+      return indicateOptimisticFixpoint();
+
+    return ChangeStatus::UNCHANGED;
+  }
+
+  ChangeStatus manifest(Attributor &A) override {
+    Argument *Arg = getAssociatedArgument();
+    if (AMDGPU::isEntryFunctionCC(Arg->getParent()->getCallingConv()))
+      return ChangeStatus::UNCHANGED;
+    return A.manifestAttrs(
+        getIRPosition(), {Attribute::get(Arg->getContext(), Attribute::InReg)});
+  }
+};
+
+AAAMDGPUUniform &AAAMDGPUUniform::createForPosition(const IRPosition &IRP,
+                                                    Attributor &A) {
+  switch (IRP.getPositionKind()) {
+  case IRPosition::IRP_ARGUMENT:
+    return *new (A.Allocator) AAAMDGPUUniformArgument(IRP, A);
+  // TODO: Since inreg is also allowed for return value, maybe we need to add
+  // AAAMDGPUUniformCallSiteReturned?
+  default:
+    llvm_unreachable("not a valid position for AAAMDGPUUniform");
+  }
+}
+
 /// Performs the final check and updates the 'amdgpu-waves-per-eu' attribute
 /// based on the finalized 'amdgpu-flat-work-group-size' attribute.
 /// Both attributes start with narrow ranges that expand during iteration.
@@ -1385,7 +1492,7 @@ static bool runImpl(Module &M, AnalysisGetter &AG, TargetMachine &TM,
        &AAAMDMaxNumWorkgroups::ID, &AAAMDWavesPerEU::ID, &AAAMDGPUNoAGPR::ID,
        &AACallEdges::ID, &AAPointerInfo::ID, &AAPotentialConstantValues::ID,
        &AAUnderlyingObjects::ID, &AAAddressSpace::ID, &AAIndirectCallInfo::ID,
-       &AAInstanceInfo::ID});
+       &AAInstanceInfo::ID, &AAAMDGPUUniform::ID});
 
   AttributorConfig AC(CGUpdater);
   AC.IsClosedWorldModule = Options.IsClosedWorld;
@@ -1438,6 +1545,11 @@ static bool runImpl(Module &M, AnalysisGetter &AG, TargetMachine &TM,
             IRPosition::value(*CmpX->getPointerOperand()));
       }
     }
+
+    if (!AMDGPU::isEntryFunctionCC(F->getCallingConv())) {
+      for (auto &Arg : F->args())
+        A.getOrCreateAAFor<AAAMDGPUUniform>(IRPosition::argument(Arg));
+    }
   }
 
   bool Changed = A.run() == ChangeStatus::CHANGED;
@@ -1470,6 +1582,7 @@ public:
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<CycleInfoWrapperPass>();
+    AU.addRequired<UniformityInfoWrapperPass>();
   }
 
   StringRef getPassName() const override { return "AMDGPU Attributor"; }
