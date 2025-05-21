@@ -255,6 +255,28 @@ TEST(FoldingRanges, ASTAll) {
           void getFooBar() { }
         };
       )cpp",
+      R"cpp(
+        //Ignore non-conditional directives
+        #include <stdio>
+
+        void func() {[[
+          int Variable = 100;
+
+          #if def(FOO) [[
+            Variable = 1;
+            some_func();
+          ]]#else[[
+            Variable = 2;
+            other_func();
+            //handle nested directives
+            #if 1[[
+              Variable = 3;
+            ]]#endif
+          ]]#endif
+
+
+          ]]}
+      )cpp",
   };
   for (const char *Test : Tests) {
     auto T = Annotations(Test);
