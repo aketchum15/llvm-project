@@ -257,17 +257,15 @@ TEST(FoldingRanges, ASTAll) {
       )cpp",
       R"cpp(
         //Ignore non-conditional directives
-        #include <stdio>
+        #define A 1
 
         void func() {[[
           int Variable = 100;
 
-          #if def(FOO) [[
+          #ifdef FOO[[
             Variable = 1;
-            some_func();
           ]]#else[[
             Variable = 2;
-            other_func();
             //handle nested directives
             #if 1[[
               Variable = 3;
